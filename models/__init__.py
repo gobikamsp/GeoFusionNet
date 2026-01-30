@@ -1,2 +1,2 @@
-from models.geomvsnet import GeoMVSNet
+from models.hybridfusionformer import HybridFusionFormer
 from models.loss import geomvsnet_loss

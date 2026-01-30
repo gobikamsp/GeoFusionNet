@@ -18,6 +18,7 @@ from datasets.dtu import DTUDataset
 from datasets.blendedmvs import BlendedMVSDataset
 
 from models.geomvsnet import GeoMVSNet
+from models.hybridfusionformer import HybridFusionFormer
 from models.loss import geomvsnet_loss
 from models.utils import *
 from models.utils.opts import get_opts
@@ -28,6 +29,39 @@ num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
 is_distributed = num_gpus > 1
 
 args = get_opts()
+
+# DEPTH EVALUATION METRICS
+@make_nograd_func
+def compute_depth_metrics(pred, gt, mask):
+    pred = pred[mask]
+    gt = gt[mask]
+
+    pred = torch.clamp(pred, min=1e-3)
+    gt = torch.clamp(gt, min=1e-3)
+
+    abs_rel = torch.mean(torch.abs(pred - gt) / gt)
+    sq_rel = torch.mean(((pred - gt) ** 2) / gt)
+    rmse = torch.sqrt(torch.mean((pred - gt) ** 2))
+    rmse_log = torch.sqrt(torch.mean((torch.log(pred) - torch.log(gt)) ** 2))
+
+    log_diff = torch.log(pred) - torch.log(gt)
+    silog = torch.sqrt(torch.mean(log_diff ** 2) - torch.mean(log_diff) ** 2) * 100
+
+    thresh = torch.max(pred / gt, gt / pred)
+    a1 = torch.mean((thresh < 1.25).float())
+    a2 = torch.mean((thresh < 1.25 ** 2).float())
+    a3 = torch.mean((thresh < 1.25 ** 3).float())
+
+    return {
+        'abs_rel': abs_rel.item(),
+        'sq_rel': sq_rel.item(),
+        'rmse': rmse.item(),
+        'rmse_log': rmse_log.item(),
+        'silog': silog.item(),
+        'a1': a1.item(),
+        'a2': a2.item(),
+        'a3': a3.item(),
+    }
 
 
 def train(model, model_loss, optimizer, TrainImgLoader, TestImgLoader, start_epoch, args):
@@ -124,8 +158,10 @@ def train_sample(model, model_loss, optimizer, sample, args):
     # @Note GeoMVSNet main
     outputs = model(
         sample_cuda["imgs"], 
+        sample_cuda["depth_list"],                          # <-- added
         sample_cuda["proj_matrices"], sample_cuda["intrinsics_matrices"], 
-        sample_cuda["depth_values"]
+        sample_cuda["depth_values"],
+        filename = sample_cuda["filename"]
     )
 
     depth_est = outputs["depth"]
@@ -154,7 +190,7 @@ def train_sample(model, model_loss, optimizer, sample, args):
         "thres4mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 4),
         "thres8mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 8),
     }
-
+    scalar_outputs.update(compute_depth_metrics(depth_est, depth_gt, mask > 0.5))
     image_outputs = {
         "depth_est": depth_est * mask,
         "depth_est_nomask": depth_est,
@@ -184,6 +220,7 @@ def test_sample_depth(model, model_loss, sample, args):
 
     outputs = model_eval(
         sample_cuda["imgs"], 
+	sample_cuda["depth_list"],                          # <-- added
         sample_cuda["proj_matrices"], sample_cuda["intrinsics_matrices"], 
         sample_cuda["depth_values"]
     )
@@ -211,7 +248,7 @@ def test_sample_depth(model, model_loss, sample, args):
         "thres4mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 4),
         "thres8mm_error": Thres_metrics(depth_est, depth_gt, mask > 0.5, 8),
     }
-
+    scalar_outputs.update(compute_depth_metrics(depth_est, depth_gt, mask > 0.5))
     image_outputs = {
         "depth_est": depth_est * mask,
         "depth_est_nomask": depth_est,
@@ -252,6 +289,7 @@ def initLogger():
 
 
 if __name__ == '__main__':
+    os.makedirs(args.logdir, exist_ok=True)  # <-- Add this line
     logger = initLogger()
 
     if args.resume:
@@ -276,6 +314,9 @@ if __name__ == '__main__':
         logger.info("creating new summary file")
         if not args.notensorboard:
             tb_writer = SummaryWriter(args.logdir)
+     
+    from models.hybridfusionformer import HybridFusionFormer
+    model = HybridFusionFormer(cfg)
 
 
     # @Note GeoMVSNet model

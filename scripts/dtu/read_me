@@ -1,0 +1,48 @@
+train_geofusionformer.py   ? training only
+plot_loss.py               ? learning verification
+infer_dtu.py               ? evaluation
+vis_depth.py               ? visualization
+
+Quantitative DTU Evaluation (MOST IMPORTANT) using eval_dtu.py
+STEP 2 — Baseline Comparison (REQUIRED for novelty)
+Suggested ablations
+
+1?? Remove transformer
+
+nhead = 0 or bypass attention
+
+
+2?? Remove input depth
+
+use_input_depth = False
+
+
+3?? Fewer views (nviews=2)
+
+STEP 4 — Qualitative Results (FIGURES)
+
+Use vis_depth.py to generate:
+
+RGB
+
+Predicted depth
+
+GT depth
+
+Error map
+
+Select 5–10 representative scenes.
+
+STEP 5 — Generalization Test (OPTIONAL but STRONG)
+
+Train on:
+
+DTU
+
+Test on:
+
+BlendedMVS
+
+OR custom scenes
+
+If it generalizes ? very strong result.

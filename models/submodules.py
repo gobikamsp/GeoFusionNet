@@ -11,12 +11,12 @@ import torch.nn.functional as F
 
 class FPN(nn.Module):
     """FPN aligncorners downsample 4x"""
-    def __init__(self, base_channels, gn=False):
+    def __init__(self, base_channels,in_channels=3, gn=False):
         super(FPN, self).__init__()
         self.base_channels = base_channels
 
         self.conv0 = nn.Sequential(
-            Conv2d(3, base_channels, 3, 1, padding=1, gn=gn),
+            Conv2d(in_channels, base_channels, 3, 1, padding=1, gn=gn),
             Conv2d(base_channels, base_channels, 3, 1, padding=1, gn=gn),
         )
 

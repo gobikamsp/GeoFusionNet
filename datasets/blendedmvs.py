@@ -9,6 +9,7 @@ import cv2
 import random
 import numpy as np
 from PIL import Image
+import torch
 
 from torch.utils.data import Dataset
 from torchvision import transforms as T
@@ -142,7 +143,7 @@ class BlendedMVSDataset(Dataset):
     def __getitem__(self, idx):
         meta = self.metas[idx]
         scan, ref_view, src_views = meta
-        
+
         if self.robust_train:
             num_src_views = len(src_views)
             index = random.sample(range(num_src_views), self.n_views - 1)
@@ -153,58 +154,54 @@ class BlendedMVSDataset(Dataset):
             scale_ratio = 1
 
         imgs = []
+        depth_list = []
         mask = None
         depth = None
         depth_min = None
         depth_max = None
 
-        proj={}
-        proj_matrices_0 = []
-        proj_matrices_1 = []
-        proj_matrices_2 = []
-        proj_matrices_3 = []
+        proj = {}
+        proj_matrices_0, proj_matrices_1 = [], []
+        proj_matrices_2, proj_matrices_3 = [], []
 
         for i, vid in enumerate(view_ids):
-            img_filename = os.path.join(self.root_dir, '{}/blended_images/{:0>8}.jpg'.format(scan, vid))
-            depth_filename = os.path.join(self.root_dir, '{}/rendered_depth_maps/{:0>8}.pfm'.format(scan, vid))
-            proj_mat_filename = os.path.join(self.root_dir, '{}/cams/{:0>8}_cam.txt'.format(scan, vid))
+            img_filename = os.path.join(self.root_dir, f"{scan}/blended_images/{vid:0>8}.jpg")
+            depth_filename = os.path.join(self.root_dir, f"{scan}/rendered_depth_maps/{vid:0>8}.pfm")
+            proj_mat_filename = os.path.join(self.root_dir, f"{scan}/cams/{vid:0>8}_cam.txt")
 
+        # Load and append image
             img = self.read_img(img_filename)
-            imgs.append(img.transpose(2,0,1))
+            imgs.append(img.transpose(2, 0, 1))
 
+        # Load and process input depth map
+            input_depth_path = os.path.join(self.root_dir, f"{scan}/input_depth_maps/{vid:0>8}.npy")
+            if input_depth_path.endswith('.npy'):
+                input_depth = np.load(input_depth_path).astype(np.float32)
+            else:
+                input_depth = cv2.imread(input_depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+
+            input_depth = cv2.resize(input_depth, self.img_wh, interpolation=cv2.INTER_NEAREST)
+            input_depth /= 1000.0
+            depth_list.append(input_depth[np.newaxis, ...])  # Shape: [1, H, W]
+
+        # Load camera parameters
             intrinsics, extrinsics, depth_min_, depth_max_ = self.read_cam_file(scan, proj_mat_filename)
 
-            proj_mat_0 = np.zeros(shape=(2, 4, 4), dtype=np.float32)
-            proj_mat_1 = np.zeros(shape=(2, 4, 4), dtype=np.float32)
-            proj_mat_2 = np.zeros(shape=(2, 4, 4), dtype=np.float32)
-            proj_mat_3 = np.zeros(shape=(2, 4, 4), dtype=np.float32)
-            extrinsics[:3, 3] *= scale_ratio
-            intrinsics[:2,:] *= 0.125
-            proj_mat_0[0,:4,:4] = extrinsics.copy()
-            proj_mat_0[1,:3,:3] = intrinsics.copy()
-            int_mat_0 = intrinsics.copy()
+        # Build projection matrices for each stage
+            proj_mats = []
+            for stage in range(4):
+                proj_mat = np.zeros((2, 4, 4), dtype=np.float32)
+                if stage > 0:
+                    intrinsics[:2, :] *= 2  # Upscale intrinsics for deeper stages
+                proj_mat[0, :4, :4] = extrinsics.copy()
+                proj_mat[1, :3, :3] = intrinsics.copy()
+                proj_mats.append(proj_mat)
 
-            intrinsics[:2,:] *= 2
-            proj_mat_1[0,:4,:4] = extrinsics.copy()
-            proj_mat_1[1,:3,:3] = intrinsics.copy()
-            int_mat_1 = intrinsics.copy()
+            proj_matrices_0.append(proj_mats[0])
+            proj_matrices_1.append(proj_mats[1])
+            proj_matrices_2.append(proj_mats[2])
+            proj_matrices_3.append(proj_mats[3])
 
-            intrinsics[:2,:] *= 2
-            proj_mat_2[0,:4,:4] = extrinsics.copy()
-            proj_mat_2[1,:3,:3] = intrinsics.copy()
-            int_mat_2 = intrinsics.copy()
-
-            intrinsics[:2,:] *= 2
-            proj_mat_3[0,:4,:4] = extrinsics.copy()
-            proj_mat_3[1,:3,:3] = intrinsics.copy()
-            int_mat_3 = intrinsics.copy()
-
-            proj_matrices_0.append(proj_mat_0)
-            proj_matrices_1.append(proj_mat_1)
-            proj_matrices_2.append(proj_mat_2)
-            proj_matrices_3.append(proj_mat_3)
-
-            # reference view
             if i == 0:
                 depth_min = depth_min_ * scale_ratio
                 depth_max = depth_max_ * scale_ratio
@@ -213,25 +210,33 @@ class BlendedMVSDataset(Dataset):
                     mask[f'stage{l+1}'] = mask[f'stage{l+1}']
                     depth[f'stage{l+1}'] = depth[f'stage{l+1}']
 
-        proj['stage1'] = np.stack(proj_matrices_0)
-        proj['stage2'] = np.stack(proj_matrices_1)
-        proj['stage3'] = np.stack(proj_matrices_2)
-        proj['stage4'] = np.stack(proj_matrices_3)
+        proj["stage1"] = np.stack(proj_matrices_0)
+        proj["stage2"] = np.stack(proj_matrices_1)
+        proj["stage3"] = np.stack(proj_matrices_2)
+        proj["stage4"] = np.stack(proj_matrices_3)
 
         intrinsics_matrices = {
-            "stage1": int_mat_0,
-            "stage2": int_mat_1,
-            "stage3": int_mat_2,
-            "stage4": int_mat_3
-        }
-        
+            "stage1": proj["stage1"][0, 1, :3, :3],
+            "stage2": proj["stage2"][0, 1, :3, :3],
+            "stage3": proj["stage3"][0, 1, :3, :3],
+            "stage4": proj["stage4"][0, 1, :3, :3]
+            }   
+
+    # Define depth_input AFTER depth is created
+        depth_input = depth["stage1"]  # shape [H, W]
+
         sample = {
-            "imgs": imgs,
-            "proj_matrices": proj,
-            "intrinsics_matrices": intrinsics_matrices,
-            "depth": depth,
+            "imgs": imgs,                                           # [N, 3, H, W]
+            "depths":  torch.from_numpy(depth_input).unsqueeze(0).unsqueeze(0).float(),  # [1, 1, H, W],  
+            "proj_matrices": proj,                                  # dict of [N, 4, 4]
+            "intrinsics_matrices": intrinsics_matrices,             # dict of [3, 3]
             "depth_values": np.array([depth_min, depth_max], dtype=np.float32),
-            "mask": mask
+            "depth": {stage: torch.from_numpy(depth[stage]).float() for stage in depth},
+            "mask": {stage: torch.from_numpy(mask[stage]).bool() for stage in mask},
+            "mask_multi": mask,                                     # dict of masks
+            "depth_list": depth_list,                               # list of depth maps
+            "filename": f"{scan}/{ref_view:0>8}",
         }
 
         return sample
+

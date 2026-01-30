@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 source scripts/data_path.sh
 
-THISNAME="geomvsnet"
+THISNAME="GeoFusionNet"
 FUSION_METHOD="open3d"
 
 LOG_DIR="./checkpoints/dtu/"$THISNAME 

@@ -1,4 +1,20 @@
 # -*- coding: utf-8 -*-
+"""
+GeoMVSNet-style homography warping and variance-based cost volume,
+adapted and hardened for HybridFusionFormer.
+
+Key adaptations:
+- Robust projection matrix handling (3x4 / 4x4, list, tensor)
+- Safe matrix inversion with pseudo-inverse fallback
+- Dynamic feature resolution support (multi-scale encoders)
+- Depth-wise chunking to prevent OOM
+- AMP-safe warping and sampling
+- DTU dataset inconsistencies tolerance
+
+This implementation is NOT a verbatim GeoMVSNet copy.
+It is modified to be numerically stable, AMP-compatible,
+and suitable for HybridFusionFormer training and inference.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

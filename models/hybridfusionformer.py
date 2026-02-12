@@ -12,16 +12,15 @@ from .decoder import DepthDecoder
 
 class HybridFusionFormer(nn.Module):
     """
-    OOM-optimized HybridFusionFormer with numeric-stability safeguards.
-
-    Changes from original:
-      - clamp depth inputs and depth hypothesis to avoid zero divisions
-      - sanitize proj_mats shapes (squeeze stray dims, promote 4x4 -> (B,4,4))
-      - normalize proj matrices by bottom-right element with clamp
-      - nan/inf checks after cost volume and before decoder; replace with safe values
-      - Multi-Stage Output: returns (depth_map, prob_volume) for Entropy/Normal losses
-      - preserve debug printing
+    Fully fixed HybridFusionFormer with:
+      - OOM-safe downsampling
+      - Numeric stability safeguards
+      - Proj_mats sanitization
+      - Depth hypothesis clamping
+      - NaN/Inf safety for cost volume and decoder
+      - Returns dict compatible with loss function
     """
+
     def __init__(self, cfg,
                  embed_dim: int = 128,
                  base_channels: int = 32,
@@ -32,40 +31,41 @@ class HybridFusionFormer(nn.Module):
                  debug: bool = False):
         super().__init__()
 
-        # store config and safety params
+        # Config
         self.cfg = cfg
-        # cap depth hypotheses to save memory during cost-volume construction
         self.cfg.depth_num = int(min(getattr(cfg, "depth_num", 48), 32))
-
         self.embed_dim = embed_dim
         self.base_channels = base_channels
         self.safe_max_tokens = safe_max_tokens
-        self.safe_input_hw = safe_input_hw  # (H, W)
+        self.safe_input_hw = safe_input_hw
         self.skip_highres = skip_highres
         self.debug = debug
 
-        # ----- Encoders (keep nhead small to save memory) -----
+        # Encoders
         self.rgb_encoder = HybridRGBEncoder(
             in_ch=3, base_channels=base_channels, embed_dim=embed_dim, nhead=nhead)
         self.depth_encoder = HybridDepthEncoder(
             in_ch=1, base_channels=base_channels, embed_dim=embed_dim, nhead=nhead)
 
-        # ----- Fusion: adapter channels must match encoder unified output (embed_dim) -----
+        # Multi-scale fusion
         self.fusion = MultiScaleFusion(
             embed_dim=embed_dim,
             nhead=nhead,
             levels=4,
-            encoder_channels=[embed_dim] * 4,  # encoder unify layers must output embed_dim channels
+            encoder_channels=[embed_dim] * 4,
             debug=debug
         )
 
-        # ----- Cost volume and decoder -----
-        # CostVolumeConstructor expects proj_mats as list-like: [ref_proj, src_proj1, ...]
-        self.cost_volume = CostVolumeConstructor(depth_num=self.cfg.depth_num, fusion_mode="variance")
+        # Cost volume + decoder
+        self.cost_volume = CostVolumeConstructor(
+            depth_num=self.cfg.depth_num,
+            fusion_mode="variance"
+        )
         self.decoder = DepthDecoder(in_channels=cfg.decoder_in_channels)
 
+    # -------------------------------
     def _maybe_downsample_inputs(self, rgb: torch.Tensor, depth: torch.Tensor):
-        """Downscale inputs to safe_input_hw if larger. Returns rgb, depth, scale_factors."""
+        """Downscale inputs if larger than safe_input_hw."""
         _, _, H, W = rgb.shape
         target_h, target_w = self.safe_input_hw
         if H > target_h or W > target_w:
@@ -76,70 +76,36 @@ class HybridFusionFormer(nn.Module):
             return rgb, depth, (target_h / H, target_w / W)
         return rgb, depth, (1.0, 1.0)
 
+    # -------------------------------
     def _ensure_proj_mats_device(self, proj_mats, device):
-        """
-        Ensure proj_mats are tensors on `device`.
-        Accepts:
-          - list/tuple of tensors
-          - single tensor shaped (B, N, 4, 4) or (B, 4, 4) / (B, 3, 4)
-        Returns list of per-view projection tensors (ref first).
-        """
+        """Convert proj_mats to list of tensors on `device`."""
         if proj_mats is None:
             return None
 
         if isinstance(proj_mats, (list, tuple)):
-            out = []
-            for p in proj_mats:
-                if isinstance(p, torch.Tensor):
-                    out.append(p.to(device))
-                else:
-                    out.append(torch.tensor(p, device=device) if not p is None else None)
-            return out
+            return [torch.as_tensor(p, device=device, dtype=torch.float32) if not isinstance(p, torch.Tensor) else p.to(device) for p in proj_mats]
         elif isinstance(proj_mats, torch.Tensor):
-            # If shape is (B, nview, 4, 4), split into list: first is ref, then sources
             if proj_mats.dim() == 4 and proj_mats.shape[1] > 1:
-                # (B, Nviews, 4, 4) -> list of (B, 4, 4)
-                pcs = [proj_mats[:, i].to(device) for i in range(proj_mats.shape[1])]
-                return pcs
+                return [proj_mats[:, i].to(device) for i in range(proj_mats.shape[1])]
             else:
                 return [proj_mats.to(device)]
         else:
-            # try converting to tensor then to device
-            try:
-                t = torch.as_tensor(proj_mats, device=device)
-                if t.dim() == 4 and t.shape[1] > 1:
-                    return [t[:, i] for i in range(t.shape[1])]
-                return [t]
-            except Exception:
-                raise ValueError("proj_mats must be list/tuple of tensors or a tensor")
+            return [torch.as_tensor(proj_mats, device=device, dtype=torch.float32)]
 
+    # -------------------------------
     def _sanitize_and_normalize_proj_mats(self, proj_mats_list, device, batch_size):
-        """
-        Make proj_mats_list a clean list of tensors shaped (B,4,4).
-        Steps:
-          - convert to tensor on device
-          - squeeze singleton dims like (B,1,4,4) -> (B,4,4)
-          - if a single (4,4) is provided, promote to (B,4,4)
-          - normalize by bottom-right element with clamp to avoid very small denominators
-        Returns: cleaned list of (B,4,4) tensors (ref first)
-        """
+        """Sanitize and normalize proj_mats: shape -> (B,4,4) and clamp homogeneous scale."""
         cleaned = []
         eps = 1e-8
         for i, p in enumerate(proj_mats_list):
             if p is None:
                 cleaned.append(None)
                 continue
-            tp = p
-            # ensure tensor and device
-            if not isinstance(tp, torch.Tensor):
-                tp = torch.as_tensor(tp, device=device, dtype=torch.float32)
-            else:
-                tp = tp.to(device)
+            tp = p if isinstance(p, torch.Tensor) else torch.as_tensor(p, device=device, dtype=torch.float32)
+            tp = tp.to(device)
 
-            # Squeeze singleton dims until we reach (B,4,4) or (4,4)
-            # but avoid accidentally squeezing batch dim if batch>1
+            # squeeze singleton dims (B,1,4,4) -> (B,4,4)
             while tp.dim() > 3:
-                # prefer to squeeze singleton middle dims (e.g., (B,1,4,4) -> (B,4,4))
                 if tp.shape[1] == 1:
                     tp = tp.squeeze(1)
                 elif tp.shape[0] == 1:
@@ -147,59 +113,52 @@ class HybridFusionFormer(nn.Module):
                 else:
                     break
 
-            # If shape is (4,4) -> promote to (B,4,4)
+            # Promote (4,4) -> (B,4,4)
             if tp.dim() == 2 and tp.shape == (4, 4):
                 tp = tp.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
-
-            # If shape is (B,4,4) and B==1 but actual batch_size>1, expand
-            if tp.dim() == 3 and tp.shape[0] == 1 and batch_size > 1:
+            elif tp.dim() == 3 and tp.shape[0] == 1 and batch_size > 1:
                 tp = tp.expand(batch_size, -1, -1).contiguous()
 
             # Final check
             if tp.dim() != 3 or tp.shape[1:] != (4, 4):
-                # As a last resort, attempt reshape if possible
                 try:
                     tp = tp.reshape(batch_size, 4, 4)
                 except Exception:
-                    raise ValueError(f"proj_mats element {i} has unsupported shape after sanitization: {tuple(tp.shape)}")
+                    raise ValueError(f"proj_mats element {i} has unsupported shape {tp.shape}")
 
-            # Normalize homogeneous scale (bottom-right element)
+            # Normalize homogeneous scale
             denom = tp[..., -1, -1].clamp(min=eps)
             tp = tp / denom.unsqueeze(-1).unsqueeze(-1)
 
-            # Final NaN/Inf guard
+            # NaN/Inf safety
             if torch.isnan(tp).any() or torch.isinf(tp).any():
                 if self.debug:
-                    print(f"[HybridFusionFormer] Warning: proj_mats element {i} contains NaN/Inf after sanitization; replacing via nan_to_num.")
+                    print(f"[HybridFusionFormer] Warning: proj_mats element {i} contains NaN/Inf; applying nan_to_num")
                 tp = torch.nan_to_num(tp, nan=0.0, posinf=1e6, neginf=-1e6)
-
             cleaned.append(tp)
         return cleaned
 
+    # -------------------------------
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor, proj_mats, depth_hypos):
         """
         Args:
             rgb: (B,3,H,W)
             depth: (B,1,H,W)
-            proj_mats: list/structure required by CostVolumeConstructor (ref first)
-            depth_hypos: (B, D) or (D,) depth hypothesis values (will respect cfg.depth_num)
+            proj_mats: list of projection matrices (ref first)
+            depth_hypos: (B,D) or (D,)
         Returns:
-            depth_map: (B,1,H_out,W_out) predicted depth
-            prob_volume: (B,D,H/4,W/4) probability volume for uncertainty/entropy loss
+            dict with stage1: {"depth", "prob_volume", "depth_hypo"}
         """
-        # 1) safety preprocessing: downsample if input is very large
-        rgb_safe, depth_safe, scale_factors = self._maybe_downsample_inputs(rgb, depth)
 
-        # clamp input depths to avoid zeros (which cause division by zero in projections)
+        # 1) Downsample inputs if needed
+        rgb_safe, depth_safe, scale_factors = self._maybe_downsample_inputs(rgb, depth)
         depth_safe = torch.clamp(depth_safe, min=1e-4)
 
-        # 1.b) ensure proj_mats are on the same device as rgb_safe and sanitized
+        # 2) Ensure proj_mats are on device and sanitized
         proj_mats = self._ensure_proj_mats_device(proj_mats, rgb_safe.device)
         proj_mats = self._sanitize_and_normalize_proj_mats(proj_mats, rgb_safe.device, batch_size=rgb_safe.shape[0])
 
-        # 2) Encode (use original encoders)
-        # Note: encoders are expected to return lists of 4 feature maps (o1..o4)
-        # Use autocast only if CUDA is available
+        # 3) Encode
         amp_ctx = autocast if torch.cuda.is_available() else (lambda *a, **k: (lambda x: x))
         with amp_ctx():
             rgb_feats = self.rgb_encoder(rgb_safe)
@@ -211,117 +170,136 @@ class HybridFusionFormer(nn.Module):
                 for i, f in enumerate(depth_feats):
                     print(f"[HybridFusionFormer] Depth feat[{i}] shape: {tuple(f.shape)}")
 
-            # 3) Multi-scale fusion (OOM-safe parameters)
-            fused_feats = self.fusion(
-                rgb_feats,
-                depth_feats,
-                max_tokens=self.safe_max_tokens,
-                skip_highres=self.skip_highres
-            )
+            # 4) Fusion
+            fused_feats = self.fusion(rgb_feats, depth_feats,
+                                      max_tokens=self.safe_max_tokens,
+                                      skip_highres=self.skip_highres)
 
             if self.debug:
                 for i, f in enumerate(fused_feats):
                     print(f"[HybridFusionFormer] Fused feat[{i}] shape: {tuple(f.shape)}")
 
-            # 4) Prepare depth_hypos: ensure (B, D) and cap to cfg.depth_num
+            # 5) Prepare depth hypotheses
             if depth_hypos is None:
                 raise ValueError("depth_hypos must be provided")
-            if isinstance(depth_hypos, torch.Tensor):
-                if depth_hypos.dim() == 1:
-                    depth_hypos = depth_hypos.unsqueeze(0)
-                if depth_hypos.shape[-1] > self.cfg.depth_num:
-                    depth_hypos = depth_hypos[:, :self.cfg.depth_num]
-            else:
-                # allow list/ndarray input
-                depth_hypos = torch.as_tensor(depth_hypos, device=rgb_safe.device, dtype=torch.float32)
-                if depth_hypos.dim() == 1:
-                    depth_hypos = depth_hypos.unsqueeze(0)
-                if depth_hypos.shape[-1] > self.cfg.depth_num:
-                    depth_hypos = depth_hypos[:, :self.cfg.depth_num]
-
-            # clamp depth hypotheses to avoid zeros / negatives
+            depth_hypos = torch.as_tensor(depth_hypos, device=rgb_safe.device, dtype=torch.float32)
+            if depth_hypos.dim() == 1:
+                depth_hypos = depth_hypos.unsqueeze(0)
+            if depth_hypos.shape[-1] > self.cfg.depth_num:
+                depth_hypos = depth_hypos[:, :self.cfg.depth_num]
             depth_hypos = torch.clamp(depth_hypos, min=1e-4)
+	    # FIX-3: normalize depth hypotheses (GeoMVSNet style)
+            depth_hypos = depth_hypos / depth_hypos.mean(dim=-1, keepdim=True)
 
-            # 5) Build cost volume (cost_volume expects proj_mats list with ref first)
-            # Add try/except and NaN-checks around cost volume construction since many ops here use projection
+
+            # 6) Build cost volume
             try:
-                cost_volume = self.cost_volume(fused_feats, proj_mats, depth_hypos)
+                cost_volume = self.cost_volume(fused_feats=[fused_feats[0]],proj_mats=[proj_mats[0]], depth_hypos=depth_hypos)
             except Exception as e:
-                # Provide helpful debug info and re-raise for developer
                 if self.debug:
-                    print("[HybridFusionFormer] Error while building cost volume:", e)
-                    print("proj_mats sanitized shapes:", [p.shape if p is not None else None for p in proj_mats])
-                    print("depth_hypos:", depth_hypos.shape, "min/max:", depth_hypos.min().item(), depth_hypos.max().item())
+                    print("[HybridFusionFormer] Error building cost volume:", e)
                 raise
 
-            # If cost_volume contains NaNs/Infs, try to salvage it safely
+            # NaN/Inf safety
             if torch.isnan(cost_volume).any() or torch.isinf(cost_volume).any():
-                if self.debug:
-                    print("[HybridFusionFormer] Warning: cost_volume contains NaN/Inf. Applying torch.nan_to_num and clamping.")
-                    # print some stats
-                    try:
-                        print(" cost_volume min/max before:", torch.nanmin(cost_volume).item(), torch.nanmax(cost_volume).item())
-                    except Exception:
-                        pass
                 cost_volume = torch.nan_to_num(cost_volume, nan=0.0, posinf=1e6, neginf=-1e6)
-                # small clamp to reasonable range to avoid huge values exploding in decoder
                 cost_volume = torch.clamp(cost_volume, min=-1e6, max=1e6)
 
-            # 6) Decode depth
+            # 7) Decode depth
             fused_highres = fused_feats[0]
             try:
-                # Decoder returns (depth_prediction, probability_volume)
                 depth_map, prob_volume = self.decoder(cost_volume, depth_hypos, fused_highres=fused_highres)
             except Exception as e:
                 if self.debug:
-                    print("[HybridFusionFormer] Error during depth decoding:", e)
+                    print("[HybridFusionFormer] Error during decoding:", e)
                 raise
 
-        # 7) If we downsampled inputs, upsample prediction back to original input size
+        # 8) Upsample if downsampled
         if scale_factors != (1.0, 1.0):
-            # original size
             _, _, orig_H, orig_W = rgb.shape
             depth_map = F.interpolate(depth_map, size=(orig_H, orig_W), mode="bilinear", align_corners=False)
 
-       
-       #return depth_map, prob_volume
-    # Wrap in a dictionary to "talk" to your loss function correctly
-            return {
-                "stage1": {
-                    "depth": depth_map,
-                    "prob_volume": prob_volume,
-                    "depth_hypo": depth_hypos
-                    } }   
+        return {
+            "stage1": {
+                "depth": depth_map,
+                "prob_volume": prob_volume,
+                "depth_hypo": depth_hypos
+            }
+        }
 
 
-# ---------------------------------------------------------------
-# Optional: lightweight config class for standalone testing
-# ---------------------------------------------------------------
+# -------------------------------
+# Optional: lightweight config for testing
+# -------------------------------
 class Config:
     def __init__(self):
         self.depth_num = 48
         self.decoder_in_channels = 64
 
 
+# -------------------------------
+# Quick test
+# -------------------------------
 if __name__ == "__main__":
-    # Quick structural test (use smaller image during dev if needed)
-    import torch
+    """
+    Sanity test that mimics the real DTU pipeline:
+    Dataset ? Model ? Stage1 output
+    """
+
+    from datasets.geofusion_dataset_dtu import GeoFusionDatasetDTU
+    from torch.utils.data import DataLoader
+
+    class Config:
+        depth_num = 48
+        decoder_in_channels = 64
+
     cfg = Config()
-    model = HybridFusionFormer(cfg, debug=True).cuda()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # ---- Dataset ----
+    dataset = GeoFusionDatasetDTU(
+        datapath="datasets/dtu_training/mvs_training/dtu",
+        listfile="datasets/dtu_training/lists/train.txt",
+        nviews=2,
+        ndepths=cfg.depth_num,
+        mode="train",
+        use_input_depth=True,
+        eval=False
+    )
+
+    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+
+    # ---- Model ----
+    model = HybridFusionFormer(cfg, debug=True).to(device)
     model.eval()
 
-    # simulate larger input (model will downsample to safe size)
-    rgb = torch.randn(1, 3, 576, 768).cuda()
-    depth = torch.randn(1, 1, 576, 768).cuda()
-    # create sane proj_mats: ref and one source (each (4,4))
-    ref = torch.eye(4).cuda()
-    src = torch.eye(4).cuda() * 1.0
-    proj_mats = [ref, src]
-    depth_hypos = torch.linspace(0.5, 10.0, steps=cfg.depth_num).cuda()
+    # ---- One forward pass ----
+    sample = next(iter(loader))
 
-    try:
-        out_depth, out_prob = model(rgb, depth, proj_mats, depth_hypos)
-        print("Output depth shape:", out_depth.shape)
-        print("Output prob shape:", out_prob.shape)
-    except Exception as e:
-        print("Model run failed:", e)
+    rgb = sample["ref_img"].unsqueeze(0).to(device)     # (1,3,H,W)
+    depth = sample["depth"].to(device)                  # (1,1,H,W)
+    proj_mats = sample["proj_mats"]                      # list of dicts
+    depth_hypos = sample["depth_hypos"].to(device)      # (D,)
+
+    # Convert dataset proj_mats dict ? tensor (c2w only)
+    #proj_mats = [p["T_c2w"].unsqueeze(0).to(device) for p in proj_mats]
+    proj_mats_fixed = []
+    for p in proj_mats:
+        K = p["K"].to(device)
+        T_c2w = p["T_c2w"].to(device)
+        T_w2c = torch.inverse(T_c2w)
+
+        P = K @ T_w2c[:3, :]
+        P4 = torch.eye(4, device=device)
+        P4[:3, :] = P
+
+        proj_mats_fixed.append(P4.unsqueeze(0))
+    proj_mats = proj_mats_fixed
+
+
+    with torch.no_grad():
+        out = model(rgb, depth, proj_mats, depth_hypos)
+
+    print("? Forward pass successful")
+    print("Depth:", out["stage1"]["depth"].shape)
+    print("Prob volume:", out["stage1"]["prob_volume"].shape)
